@@ -1,0 +1,503 @@
+"""JB Hi-Fi Pokemon TCG monitor.
+
+Polls JB Hi-Fi's search API for Pokemon TCG products sold by JB Hi-Fi itself
+(no marketplace sellers), posts Discord alerts for new listings and restocks,
+and keeps a single "currently available" board message up to date.
+
+Standard library only, so it runs on a bare GitHub Actions runner.
+
+Usage:
+    python monitor.py               # normal run (used by the workflow)
+    python monitor.py --dry-run     # fetch + diff, print payloads, send nothing, save nothing
+    python monitor.py --test-alert  # send one sample alert so you can see the format
+
+Environment:
+    DISCORD_WEBHOOK_URL        required  channel that receives alerts
+    DISCORD_BOARD_WEBHOOK_URL  optional  channel for the live board (defaults to the alert webhook)
+    DISCORD_PING               optional  mention added to alerts, e.g. <@123> or <@&456>
+    INCLUDE_ACCESSORIES        optional  "true" to also track sleeves/binders/deck boxes
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --------------------------------------------------------------------------- config
+
+API_URL = "https://api-prod.jbhifi.com.au/OnlineSearchApi/search"
+# Public key the jbhifi.com.au frontend sends with every search request.
+API_HEADERS = {
+    "content-type": "application/json",
+    "accept": "application/json",
+    "origin": "https://www.jbhifi.com.au",
+    "referer": "https://www.jbhifi.com.au/",
+    "x-jbg-api-key": "980e245d7d344759bfcb5f02ba91fae4",
+    "x-jbg-company": "JBH",
+    "x-jbg-country": "AU",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+    ),
+}
+# Server-side filter: trading cards, Pokemon franchise, sold by JB (not marketplace).
+SEARCH_FILTER = (
+    'attributes.categoryHierarchy: ANY("Trading card games") '
+    'AND attributes.Primary_20franchise: ANY("Pokemon") '
+    'AND attributes.isMarketplace: ANY("false")'
+)
+PRODUCT_URL = "https://www.jbhifi.com.au/products/{handle}"
+
+GROUP_CARDS = 1186        # MERCH TRADING CARDS (boosters, ETBs, decks, boxes)
+GROUP_ACCESSORIES = 1106  # MERCH TRADING CARD ACCESSORIES (sleeves, binders...)
+
+STATE_FILE = Path(__file__).with_name("state.json")
+
+STATUS_STYLE = {
+    # status:      (label,          colour,   emoji)
+    "preorder":    ("Pre-order",     0x8B5CF6, "🟣"),
+    "in_stock":    ("In stock",      0x22C55E, "🟢"),
+    "limited":     ("Limited stock", 0xF59E0B, "🟠"),
+    "unavailable": ("Sold out",      0x6B7280, "⚫"),
+}
+AVAILABLE = {"preorder", "in_stock", "limited"}
+
+# --------------------------------------------------------------------------- JB API
+
+
+def http_json(url: str, body: dict | None, headers: dict, method: str = "POST", retries: int = 3):
+    data = json.dumps(body).encode() if body is not None else None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                if attempt < retries:
+                    wait = float(e.headers.get("Retry-After") or 2 * attempt)
+                    time.sleep(wait)
+                    continue
+            return e.code, _safe_json(e.read())
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == retries:
+                raise
+            time.sleep(2 * attempt)
+    raise RuntimeError("unreachable")
+
+
+def _safe_json(raw: bytes):
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw.decode(errors="replace")[:500]
+
+
+def fetch_products(include_accessories: bool) -> dict[str, dict]:
+    groups = {GROUP_CARDS} | ({GROUP_ACCESSORIES} if include_accessories else set())
+    products: dict[str, dict] = {}
+    token = None
+    for _ in range(20):  # page guard
+        body = {"query": "pokemon", "filter": SEARCH_FILTER, "pageSize": 100}
+        if token:
+            body["pageToken"] = token
+        status, data = http_json(API_URL, body, API_HEADERS)
+        if status != 200 or not isinstance(data, dict):
+            raise RuntimeError(f"JB search failed: HTTP {status}: {data}")
+        for hit in data.get("hits", []):
+            if hit.get("isMarketplace"):
+                continue
+            if (hit.get("productGroup") or {}).get("id") not in groups:
+                continue
+            p = normalise(hit)
+            products[p["sku"]] = p
+        token = data.get("nextPageToken")
+        if not token:
+            break
+    return products
+
+
+def normalise(hit: dict) -> dict:
+    avail = hit.get("availability") or {}
+    product = hit.get("product") or {}
+    pricing = hit.get("pricing") or {}
+
+    if avail.get("canPreOrder") or avail.get("productLifecycle") == "PreOrder":
+        status = "preorder"
+    elif not avail.get("canBuyOnline") and avail.get("cashNCarryStatus") in (None, "NotAvailable"):
+        status = "unavailable"
+    elif avail.get("overallStatus") == "InStock":
+        status = "in_stock"
+    elif avail.get("overallStatus") == "LimitedStock":
+        status = "limited"
+    else:
+        status = "unavailable"
+
+    where = []
+    if avail.get("deliveryStatus") not in (None, "NotAvailable"):
+        where.append("Online")
+    if avail.get("cashNCarryStatus") not in (None, "NotAvailable"):
+        where.append("In-store")
+
+    was = pricing.get("wasPrice") if pricing.get("saveAmount") else None
+    return {
+        "sku": str(hit["sku"]),
+        "title": hit.get("title", "").strip(),
+        "url": PRODUCT_URL.format(handle=hit.get("handle", "")),
+        "image": hit.get("product_image") or "",
+        "price": float(hit.get("price") or 0),
+        "was_price": float(was) if was else None,
+        "status": status,
+        "where": where,
+        "limit": product.get("limitPerOrder"),
+        "release": product.get("releaseDate"),
+        "expansion": ((hit.get("facets") or {}).get("Expansion") or [None])[0],
+        "group": (hit.get("productGroup") or {}).get("id"),
+    }
+
+
+# --------------------------------------------------------------------------- formatting
+
+
+def money(v: float | None) -> str:
+    if v is None:
+        return "—"
+    return f"${v:,.0f}" if float(v).is_integer() else f"${v:,.2f}"
+
+
+def short_title(title: str) -> str:
+    for prefix in ("Pokemon TCG - ", "Pokémon TCG - ", "Pokemon TCG: ", "Pokémon TCG: ",
+                   "Pokemon Trading Card Game - ", "Pokemon TCG "):
+        if title.startswith(prefix):
+            return title[len(prefix):]
+    return title
+
+
+def ts(iso: str | None, style: str = "D") -> str | None:
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return f"<t:{int(dt.timestamp())}:{style}>"
+
+
+def is_future(iso: str | None) -> bool:
+    if not iso:
+        return False
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")) > datetime.now(timezone.utc)
+    except ValueError:
+        return False
+
+
+def alert_embed(p: dict, kind: str) -> dict:
+    label, colour, emoji = STATUS_STYLE[p["status"]]
+    heading = {"new": "New listing", "restock": "Back in stock"}[kind]
+
+    price = money(p["price"])
+    if p["was_price"]:
+        price += f"  ~~{money(p['was_price'])}~~"
+
+    fields = [
+        {"name": "Price", "value": price, "inline": True},
+        {"name": "Status", "value": f"{emoji} {label}", "inline": True},
+        {"name": "Limit", "value": f"{p['limit']} per customer" if p["limit"] else "—", "inline": True},
+    ]
+    if p["status"] == "preorder" or is_future(p["release"]):
+        rel = ts(p["release"], "D")
+        if rel:
+            fields.append({"name": "Release", "value": f"{rel} ({ts(p['release'], 'R')})", "inline": True})
+    if p["where"]:
+        fields.append({"name": "Available", "value": " · ".join(p["where"]), "inline": True})
+    if p["expansion"]:
+        fields.append({"name": "Set", "value": p["expansion"], "inline": True})
+
+    embed = {
+        "author": {"name": f"JB Hi-Fi  •  {heading}"},
+        "title": p["title"][:256],
+        "url": p["url"],
+        "color": colour,
+        "fields": fields,
+        "footer": {"text": f"SKU {p['sku']}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if p["image"]:
+        embed["thumbnail"] = {"url": p["image"]}
+    return embed
+
+
+def board_embeds(products: dict[str, dict]) -> list[dict]:
+    now = int(time.time())
+    sections = [
+        ("preorder", "Pre-orders"),
+        ("in_stock", "In stock"),
+        ("limited", "Limited stock"),
+    ]
+    live = [p for p in products.values() if p["status"] in AVAILABLE]
+
+    header = {
+        "title": "JB Hi-Fi — Pokémon TCG available now",
+        "url": "https://www.jbhifi.com.au/collections/pokemon-trading-cards",
+        "color": 0xFACC15,
+        "description": (
+            f"**{len(live)}** products live"
+            + "".join(
+                f"  ·  {STATUS_STYLE[s][2]} {sum(1 for p in live if p['status'] == s)}"
+                for s, _ in sections
+            )
+            + f"\nLast checked <t:{now}:R>"
+        ),
+    }
+    embeds = [header]
+    budget = 6000 - len(header["title"]) - len(header["description"])
+
+    for status, name in sections:
+        items = sorted(
+            (p for p in live if p["status"] == status),
+            key=lambda p: (p["release"] or "", p["title"]) if status == "preorder" else (-p["price"], p["title"]),
+        )
+        if not items:
+            continue
+        label, colour, emoji = STATUS_STYLE[status]
+        lines = []
+        for p in items:
+            extra = [money(p["price"])]
+            if status == "preorder":
+                rel = ts(p["release"], "d")
+                if rel:
+                    extra.append(f"out {rel}")
+            elif p["where"] == ["In-store"]:
+                extra.append("in-store only")
+            lines.append(f"[{short_title(p['title'])}]({p['url']})\n└ " + " · ".join(extra))
+
+        title = f"{emoji} {name} ({len(items)})"
+        desc, shown = "", 0
+        cap = min(4000, budget - len(title) - 40)
+        for line in lines:
+            if len(desc) + len(line) + 2 > cap:
+                break
+            desc += line + "\n\n"
+            shown += 1
+        if shown < len(lines):
+            desc += f"*…and {len(lines) - shown} more*"
+        if cap <= 0 or not desc:
+            break
+        embeds.append({"title": title, "color": colour, "description": desc.strip()})
+        budget -= len(title) + len(desc)
+
+    if len(embeds) == 1:
+        header["description"] += "\n\nNothing available right now."
+    return embeds[:10]
+
+
+# --------------------------------------------------------------------------- Discord
+
+
+def webhook_parts(url: str) -> str:
+    return url.split("?")[0].rstrip("/")
+
+
+def discord_send(webhook: str, payload: dict) -> str | None:
+    url = webhook_parts(webhook) + "?wait=true"
+    status, data = http_json(url, payload, {"content-type": "application/json", "user-agent": "jb-tcg-monitor"})
+    if status not in (200, 204):
+        raise RuntimeError(f"Discord send failed: HTTP {status}: {data}")
+    return (data or {}).get("id")
+
+
+def discord_edit(webhook: str, message_id: str, payload: dict) -> bool:
+    url = f"{webhook_parts(webhook)}/messages/{message_id}"
+    status, data = http_json(url, payload, {"content-type": "application/json", "user-agent": "jb-tcg-monitor"},
+                             method="PATCH")
+    if status == 404:
+        return False
+    if status != 200:
+        raise RuntimeError(f"Discord edit failed: HTTP {status}: {data}")
+    return True
+
+
+def send_alerts(webhook: str, ping: str, alerts: list[tuple[dict, str]]) -> None:
+    # Discord allows 10 embeds per message; batch so a big drop is one or two messages.
+    for i in range(0, len(alerts), 10):
+        batch = alerts[i:i + 10]
+        payload = {
+            "username": "JB Hi-Fi Monitor",
+            "embeds": [alert_embed(p, kind) for p, kind in batch],
+            "allowed_mentions": {"parse": ["users", "roles"]},
+        }
+        if ping:
+            payload["content"] = ping
+        discord_send(webhook, payload)
+        time.sleep(1)
+
+
+def update_board(webhook: str, state: dict, products: dict[str, dict]) -> None:
+    payload = {"embeds": board_embeds(products), "allowed_mentions": {"parse": []}}
+    msg_id = state.get("board_message_id")
+    if msg_id and discord_edit(webhook, msg_id, payload):
+        return
+    payload["username"] = "JB Hi-Fi Monitor"
+    state["board_message_id"] = discord_send(webhook, payload)
+    print(f"Posted new board message {state['board_message_id']} — pin it in Discord.")
+
+
+# --------------------------------------------------------------------------- state + diff
+
+
+def load_state() -> dict | None:
+    if not STATE_FILE.exists():
+        return None
+    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def diff(prev: dict[str, dict], current: dict[str, dict]) -> list[tuple[dict, str]]:
+    alerts = []
+    for sku, p in current.items():
+        old = prev.get(sku)
+        if old is None:
+            if p["status"] in AVAILABLE:
+                alerts.append((p, "new"))
+        elif p["status"] in AVAILABLE and old.get("status") not in AVAILABLE:
+            alerts.append((p, "restock"))
+    return alerts
+
+
+def merge(prev: dict[str, dict], current: dict[str, dict]) -> dict[str, dict]:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    merged = {}
+    for sku, p in current.items():
+        # No per-run timestamps here, so state.json only changes (and gets committed) on real changes.
+        merged[sku] = {**p, "first_seen": prev.get(sku, {}).get("first_seen", now)}
+    for sku, old in prev.items():
+        if sku not in current:
+            # Dropped out of search results: JB hides sold-out/delisted items.
+            merged[sku] = {**old, "status": "unavailable"}
+    return merged
+
+
+# --------------------------------------------------------------------------- timing
+
+INTERVAL_MIN = 15      # check on every quarter hour...
+OFFSET_SEC = 1         # ...one second past it: 4:00:01, 4:15:01, ...
+
+
+def slot_for(now: float, cron_minute: int | None) -> float:
+    """The check time this run is responsible for.
+
+    With the cron minute that triggered the run (e.g. 53), the slot is the first quarter hour
+    after the most recent firing of that minute, so a run GitHub started late still knows which
+    slot it was meant for. Without it, fall back to the next quarter hour.
+    """
+    period = INTERVAL_MIN * 60
+    if cron_minute is None:
+        return (now - OFFSET_SEC) // period * period + period + OFFSET_SEC
+    hour = now // 3600 * 3600
+    fired = hour + cron_minute * 60
+    if fired > now:
+        fired -= 3600
+    return (fired // period) * period + period + OFFSET_SEC
+
+
+def wait_for_slot(cron_minute: int | None) -> None:
+    now = time.time()
+    slot = slot_for(now, cron_minute)
+    wait = slot - now
+    when = datetime.fromtimestamp(slot, timezone.utc).strftime("%H:%M:%S UTC")
+    if wait <= 0:
+        # GitHub started us after the slot; check now rather than skip it.
+        print(f"Started {-wait:.0f}s after the {when} slot; checking immediately.")
+        return
+    print(f"Waiting {wait:.1f}s for {when}")
+    while (remaining := slot - time.time()) > 0:
+        time.sleep(min(remaining, 30))
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # emoji in output on Windows consoles
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test-alert", action="store_true")
+    ap.add_argument("--at-quarter", action="store_true",
+                    help="sleep until the next :00:01/:15:01/:30:01/:45:01 before checking")
+    ap.add_argument("--schedule", default="",
+                    help='cron expression that triggered the run (GitHub passes e.g. "53 * * * *")')
+    args = ap.parse_args()
+
+    alert_hook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    board_hook = os.environ.get("DISCORD_BOARD_WEBHOOK_URL", "").strip() or alert_hook
+    ping = os.environ.get("DISCORD_PING", "").strip()
+    include_acc = os.environ.get("INCLUDE_ACCESSORIES", "").lower() in ("1", "true", "yes")
+
+    if not alert_hook and not args.dry_run:
+        print("DISCORD_WEBHOOK_URL is not set", file=sys.stderr)
+        return 2
+
+    if args.at_quarter:
+        first = args.schedule.split()[0] if args.schedule.strip() else ""
+        wait_for_slot(int(first) if first.isdigit() else None)
+
+    started = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    current = fetch_products(include_acc)
+    print(f"[{started} UTC] Fetched {len(current)} products "
+          f"({sum(p['status'] in AVAILABLE for p in current.values())} available)")
+
+    if args.test_alert:
+        sample = next((p for p in current.values() if p["status"] in AVAILABLE), None)
+        if not sample:
+            print("Nothing available to use as a sample.")
+            return 1
+        send_alerts(alert_hook, ping, [(sample, "new")])
+        print(f"Sent test alert for {sample['title']}")
+        return 0
+
+    state = load_state()
+    first_run = state is None
+    state = state or {"products": {}}
+    prev = state.get("products", {})
+
+    # A suspiciously empty result usually means the API hiccuped; don't mark everything sold out.
+    if not current and prev:
+        print("API returned no products; skipping this run to avoid false sold-out states.")
+        return 0
+
+    alerts = [] if first_run else diff(prev, current)
+    merged = merge(prev, current)
+
+    if args.dry_run:
+        for p, kind in alerts:
+            print(f"[{kind}] {p['title']} — {money(p['price'])} — {p['status']}")
+        print(json.dumps({"embeds": board_embeds(merged)}, indent=2, ensure_ascii=False))
+        return 0
+
+    if first_run:
+        print("First run: seeding state without alerts.")
+    if alerts:
+        print(f"Sending {len(alerts)} alert(s)")
+        send_alerts(alert_hook, ping, alerts)
+
+    state["products"] = merged
+    update_board(board_hook, state, merged)
+    save_state(state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
