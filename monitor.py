@@ -21,8 +21,10 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import random
 import sys
 import time
 import urllib.error
@@ -58,7 +60,6 @@ PRODUCT_URL = "https://www.jbhifi.com.au/products/{handle}"
 GROUP_CARDS = 1186        # MERCH TRADING CARDS (boosters, ETBs, decks, boxes)
 GROUP_ACCESSORIES = 1106  # MERCH TRADING CARD ACCESSORIES (sleeves, binders...)
 
-STATE_FILE = Path(__file__).with_name("state.json")
 
 STATUS_STYLE = {
     # status:      (label,          colour,   emoji)
@@ -161,6 +162,9 @@ def normalise(hit: dict) -> dict:
         "release": product.get("releaseDate"),
         "expansion": ((hit.get("facets") or {}).get("Expansion") or [None])[0],
         "group": (hit.get("productGroup") or {}).get("id"),
+        # When JB published / last touched the listing; used only for latency logging.
+        "_published": hit.get("published_at"),
+        "_updated": hit.get("updated_at"),
     }
 
 
@@ -380,14 +384,14 @@ def update_board(webhook: str, state: dict, products: dict[str, dict]) -> None:
 # --------------------------------------------------------------------------- state + diff
 
 
-def load_state() -> dict | None:
-    if not STATE_FILE.exists():
+def load_state(path: Path) -> dict | None:
+    if not path.exists():
         return None
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+def save_state(state: dict, path: Path) -> None:
+    path.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def diff(prev: dict[str, dict], current: dict[str, dict]) -> list[tuple[dict, str]]:
@@ -407,7 +411,9 @@ def merge(prev: dict[str, dict], current: dict[str, dict]) -> dict[str, dict]:
     merged = {}
     for sku, p in current.items():
         # No per-run timestamps here, so state.json only changes (and gets committed) on real changes.
-        merged[sku] = {**p, "first_seen": prev.get(sku, {}).get("first_seen", now)}
+        # Keys starting with "_" are per-fetch metadata (JB timestamps) and are not persisted.
+        kept = {k: v for k, v in p.items() if not k.startswith("_")}
+        merged[sku] = {**kept, "first_seen": prev.get(sku, {}).get("first_seen", now)}
     for sku, old in prev.items():
         if sku not in current:
             # Dropped out of search results: JB hides sold-out/delisted items.
@@ -455,74 +461,198 @@ def wait_for_slot(cron_minute: int | None) -> None:
 # --------------------------------------------------------------------------- main
 
 
+LOG_DIR = Path(__file__).with_name("logs")
+
+
+def load_dotenv(path: Path) -> None:
+    """Minimal .env loader for local runs (KEY=VALUE lines). Real env vars win."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def log_csv(name: str, header: list[str], row: list) -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    path = LOG_DIR / name
+    new = not path.exists()
+    with path.open("a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(header)
+        w.writerow(row)
+
+
+def log_latency(alerts: list[tuple[dict, str]], detected: datetime) -> None:
+    """How long after JB published (new) / last updated (restock) the listing we noticed it."""
+    for p, kind in alerts:
+        ref = p.get("_published") if kind == "new" else p.get("_updated")
+        lag = None
+        if ref:
+            try:
+                lag = round((detected - datetime.fromisoformat(ref.replace("Z", "+00:00"))).total_seconds(), 1)
+            except ValueError:
+                pass
+        log_csv("latency.csv",
+                ["detected_utc", "kind", "sku", "title", "status", "jb_timestamp", "lag_seconds"],
+                [detected.isoformat(timespec="seconds"), kind, p["sku"], p["title"], p["status"], ref, lag])
+        print(f"  latency {kind} {p['sku']}: {lag}s after JB timestamp {ref}")
+
+
+def process(state: dict, current: dict[str, dict], cfg: dict, dry_run: bool,
+            log_lag: bool = False) -> tuple[dict, list[tuple[dict, str]]]:
+    """Diff a fetch against state, send alerts, return (merged products, alerts)."""
+    prev = state.get("products", {})
+    first_run = not prev and not state.get("seeded")
+    alerts = [] if first_run else diff(prev, current)
+    merged = merge(prev, current)
+    if first_run:
+        print("First run: seeding state without alerts.")
+    for p, kind in alerts:
+        print(f"[{kind}] {p['title']} — {money(p['price'])} — {p['status']}")
+    if log_lag and alerts:
+        log_latency(alerts, datetime.now(timezone.utc))
+    if alerts and not dry_run:
+        send_alerts(cfg["alert_hook"], cfg["ping"], alerts)
+    state["seeded"] = True
+    return merged, alerts
+
+
+POLL_HEADER = ["utc", "ok", "ms", "products", "available", "error"]
+
+
+def fetch_logged(cfg: dict) -> dict[str, dict]:
+    t0 = time.time()
+    started = datetime.now(timezone.utc)
+    try:
+        current = fetch_products(cfg["include_acc"])
+    except Exception as e:
+        if cfg.get("log_polls"):
+            log_csv("polls.csv", POLL_HEADER,
+                    [started.isoformat(timespec="seconds"), 0, int((time.time() - t0) * 1000), "", "", str(e)[:200]])
+        raise
+    ms = int((time.time() - t0) * 1000)
+    avail = sum(p["status"] in AVAILABLE for p in current.values())
+    if cfg.get("log_polls"):
+        log_csv("polls.csv", POLL_HEADER, [started.isoformat(timespec="seconds"), 1, ms, len(current), avail, ""])
+    print(f"[{started.strftime('%H:%M:%S.%f')[:-3]} UTC] Fetched {len(current)} products "
+          f"({avail} available) in {ms} ms")
+    return current
+
+
+def run_once(cfg: dict, state_path: Path, dry_run: bool) -> int:
+    current = fetch_logged(cfg)
+    state = load_state(state_path) or {"products": {}}
+    if not current and state.get("products"):
+        print("API returned no products; skipping this run to avoid false sold-out states.")
+        return 0
+    merged, _ = process(state, current, cfg, dry_run)
+    if dry_run:
+        print(json.dumps({"embeds": board_embeds(merged)}, indent=2, ensure_ascii=False))
+        return 0
+    state["products"] = merged
+    update_board(cfg["board_hook"], state, merged)
+    save_state(state, state_path)
+    return 0
+
+
+def run_loop(cfg: dict, state_path: Path, interval: float, dry_run: bool) -> int:
+    """Poll forever. Board is refreshed when something changes, or at most once a minute."""
+    board_every = 60
+    state = load_state(state_path) or {"products": {}}
+    last_board = 0.0
+    failures = 0
+    print(f"Loop mode: polling every ~{interval:g}s (±20%), state in {state_path.name}. Ctrl-C to stop.")
+    while True:
+        t0 = time.time()
+        try:
+            current = fetch_logged(cfg)
+            failures = 0
+            if not current and state.get("products"):
+                print("  empty result; ignoring")
+            else:
+                before = json.dumps(state.get("products", {}), sort_keys=True)
+                ids_before = state.get("board_message_ids")
+                merged, _ = process(state, current, cfg, dry_run, log_lag=True)
+                state["products"] = merged
+                changed = json.dumps(merged, sort_keys=True) != before
+                if not dry_run and (changed or time.time() - last_board >= board_every):
+                    update_board(cfg["board_hook"], state, merged)
+                    last_board = time.time()
+                if not dry_run and (changed or state.get("board_message_ids") != ids_before):
+                    save_state(state, state_path)
+            delay = interval * random.uniform(0.8, 1.2) - (time.time() - t0)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            failures += 1
+            delay = min(300, interval * 2 ** failures)  # back off hard on errors / 429s
+            print(f"  error #{failures}: {e} — backing off {delay:.0f}s", file=sys.stderr)
+        time.sleep(max(1.0, delay))
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")  # emoji in output on Windows consoles
+        # UTF-8 for emoji on Windows consoles; line buffering so loop output shows up live in logs.
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+        sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--test-alert", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="don't send to Discord or write state")
+    ap.add_argument("--test-alert", action="store_true", help="send one sample alert and exit")
     ap.add_argument("--at-quarter", action="store_true",
                     help="sleep until the next :00:01/:15:01/:30:01/:45:01 before checking")
     ap.add_argument("--schedule", default="",
                     help='cron expression that triggered the run (GitHub passes e.g. "53 * * * *")')
+    ap.add_argument("--loop", type=float, metavar="SECONDS",
+                    help="poll continuously every SECONDS (±20%%), logging to logs/")
+    ap.add_argument("--state", default="state.json", help="state file (use a separate one for local trials)")
+    ap.add_argument("--env-file", default=".env", help="local file with DISCORD_WEBHOOK_URL=... etc.")
     args = ap.parse_args()
 
+    here = Path(__file__).parent
+    load_dotenv(here / args.env_file)
     alert_hook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    board_hook = os.environ.get("DISCORD_BOARD_WEBHOOK_URL", "").strip() or alert_hook
-    ping = os.environ.get("DISCORD_PING", "").strip()
-    include_acc = os.environ.get("INCLUDE_ACCESSORIES", "").lower() in ("1", "true", "yes")
+    cfg = {
+        "alert_hook": alert_hook,
+        "board_hook": os.environ.get("DISCORD_BOARD_WEBHOOK_URL", "").strip() or alert_hook,
+        "ping": os.environ.get("DISCORD_PING", "").strip(),
+        "include_acc": os.environ.get("INCLUDE_ACCESSORIES", "").lower() in ("1", "true", "yes"),
+        "log_polls": bool(args.loop),
+    }
+    state_path = Path(args.state) if Path(args.state).is_absolute() else here / args.state
 
     if not alert_hook and not args.dry_run:
-        print("DISCORD_WEBHOOK_URL is not set", file=sys.stderr)
+        print("DISCORD_WEBHOOK_URL is not set (env var or .env file)", file=sys.stderr)
         return 2
 
-    if args.at_quarter:
-        first = args.schedule.split()[0] if args.schedule.strip() else ""
-        wait_for_slot(int(first) if first.isdigit() else None)
-
-    started = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-    current = fetch_products(include_acc)
-    print(f"[{started} UTC] Fetched {len(current)} products "
-          f"({sum(p['status'] in AVAILABLE for p in current.values())} available)")
-
     if args.test_alert:
+        current = fetch_logged(cfg)
         sample = next((p for p in current.values() if p["status"] in AVAILABLE), None)
         if not sample:
             print("Nothing available to use as a sample.")
             return 1
-        send_alerts(alert_hook, ping, [(sample, "new")])
+        send_alerts(alert_hook, cfg["ping"], [(sample, "new")])
         print(f"Sent test alert for {sample['title']}")
         return 0
 
-    state = load_state()
-    first_run = state is None
-    state = state or {"products": {}}
-    prev = state.get("products", {})
+    if args.loop:
+        if args.loop < 5:
+            print("--loop below 5 seconds is asking to get rate-limited; use 5 or more.", file=sys.stderr)
+            return 2
+        try:
+            return run_loop(cfg, state_path, args.loop, args.dry_run)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return 0
 
-    # A suspiciously empty result usually means the API hiccuped; don't mark everything sold out.
-    if not current and prev:
-        print("API returned no products; skipping this run to avoid false sold-out states.")
-        return 0
-
-    alerts = [] if first_run else diff(prev, current)
-    merged = merge(prev, current)
-
-    if args.dry_run:
-        for p, kind in alerts:
-            print(f"[{kind}] {p['title']} — {money(p['price'])} — {p['status']}")
-        print(json.dumps({"embeds": board_embeds(merged)}, indent=2, ensure_ascii=False))
-        return 0
-
-    if first_run:
-        print("First run: seeding state without alerts.")
-    if alerts:
-        print(f"Sending {len(alerts)} alert(s)")
-        send_alerts(alert_hook, ping, alerts)
-
-    state["products"] = merged
-    update_board(board_hook, state, merged)
-    save_state(state)
-    return 0
+    if args.at_quarter:
+        first = args.schedule.split()[0] if args.schedule.strip() else ""
+        wait_for_slot(int(first) if first.isdigit() else None)
+    return run_once(cfg, state_path, args.dry_run)
 
 
 if __name__ == "__main__":

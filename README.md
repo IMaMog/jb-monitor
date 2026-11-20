@@ -49,10 +49,28 @@ By default it tracks sealed card product only (boosters, blisters, display boxes
 
 ## Running locally
 
+Copy `.env.example` to `.env` and fill in a webhook. Use a **separate test channel** while trialling, so it doesn't double up with the GitHub monitor.
+
 ```bash
-python monitor.py --dry-run                                   # no Discord, no state written
-DISCORD_WEBHOOK_URL=... python monitor.py --test-alert        # send one sample alert
+python monitor.py --dry-run          # fetch + print, no Discord, no state written
+python monitor.py --test-alert       # send one sample alert
 ```
+
+## Near-live loop mode (trial)
+
+```bash
+python monitor.py --loop 15 --state state.local.json
+```
+
+- Polls every ~15 s (randomised ±20% so it isn't perfectly regular), sends alerts the moment something changes, and refreshes the board when something changes or once a minute.
+- `--state state.local.json` keeps the trial's state separate from GitHub's `state.json`. The first poll records what's listed without alerting.
+- On errors or 429s, it backs off (2×, 4×… the interval, up to 5 minutes), then carries on.
+- Logs go to `logs/` (git-ignored):
+  - `polls.csv`: every request, with success/failure, response time and product count. Use it to spot rate limiting.
+  - `latency.csv`: for every alert, how many seconds after JB's `published_at` (new listings) or `updated_at` (restocks) it was detected. This is the real-world delay, including any lag in JB's search index.
+- Stop with Ctrl-C. Intervals under 5 s are refused.
+
+If the trial looks good, run it permanently on an always-on machine and turn off the GitHub schedule, so alerts don't arrive twice.
 
 ## Caveats
 
