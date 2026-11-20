@@ -259,45 +259,40 @@ def board_embeds(products: dict[str, dict]) -> list[dict]:
         ),
     }
     embeds = [header]
-    budget = 6000 - len(header["title"]) - len(header["description"])
-
-    for status, name in sections:
+    for status, _ in sections:
         items = sorted(
             (p for p in live if p["status"] == status),
             key=lambda p: (p["release"] or "", p["title"]) if status == "preorder" else (-p["price"], p["title"]),
         )
-        if not items:
-            continue
-        label, colour, emoji = STATUS_STYLE[status]
-        lines = []
-        for p in items:
-            extra = [money(p["price"])]
-            if status == "preorder":
-                rel = ts(p["release"], "d")
-                if rel:
-                    extra.append(f"out {rel}")
-            elif p["where"] == ["In-store"]:
-                extra.append("in-store only")
-            lines.append(f"[{short_title(p['title'])}]({p['url']})\n└ " + " · ".join(extra))
-
-        title = f"{emoji} {name} ({len(items)})"
-        desc, shown = "", 0
-        cap = min(4000, budget - len(title) - 40)
-        for line in lines:
-            if len(desc) + len(line) + 2 > cap:
-                break
-            desc += line + "\n\n"
-            shown += 1
-        if shown < len(lines):
-            desc += f"*…and {len(lines) - shown} more*"
-        if cap <= 0 or not desc:
-            break
-        embeds.append({"title": title, "color": colour, "description": desc.strip()})
-        budget -= len(title) + len(desc)
+        embeds.extend(board_card(p) for p in items)
 
     if len(embeds) == 1:
         header["description"] += "\n\nNothing available right now."
-    return embeds[:10]
+    return embeds
+
+
+def board_card(p: dict) -> dict:
+    """One compact card per product: image on the right, colour = status."""
+    label, colour, emoji = STATUS_STYLE[p["status"]]
+    line1 = [f"**{money(p['price'])}**", f"{emoji} {label}"]
+    if p["status"] == "preorder" or is_future(p["release"]):
+        rel = ts(p["release"], "D")
+        if rel:
+            line1.append(f"out {rel}")
+    line2 = []
+    if p["limit"]:
+        line2.append(f"Limit {p['limit']}")
+    if p["where"]:
+        line2.append(" + ".join(p["where"]))
+    card = {
+        "title": short_title(p["title"])[:256],
+        "url": p["url"],
+        "color": colour,
+        "description": " · ".join(line1) + ("\n" + " · ".join(line2) if line2 else ""),
+    }
+    if p["image"]:
+        card["thumbnail"] = {"url": p["image"]}
+    return card
 
 
 # --------------------------------------------------------------------------- Discord
@@ -341,14 +336,45 @@ def send_alerts(webhook: str, ping: str, alerts: list[tuple[dict, str]]) -> None
         time.sleep(1)
 
 
+def discord_delete(webhook: str, message_id: str) -> None:
+    url = f"{webhook_parts(webhook)}/messages/{message_id}"
+    status, data = http_json(url, None, {"user-agent": "jb-tcg-monitor"}, method="DELETE")
+    if status not in (204, 404):
+        raise RuntimeError(f"Discord delete failed: HTTP {status}: {data}")
+
+
 def update_board(webhook: str, state: dict, products: dict[str, dict]) -> None:
-    payload = {"embeds": board_embeds(products), "allowed_mentions": {"parse": []}}
-    msg_id = state.get("board_message_id")
-    if msg_id and discord_edit(webhook, msg_id, payload):
-        return
-    payload["username"] = "JB Hi-Fi Monitor"
-    state["board_message_id"] = discord_send(webhook, payload)
-    print(f"Posted new board message {state['board_message_id']} — pin it in Discord.")
+    embeds = board_embeds(products)
+    # Discord caps a message at 10 embeds: header + 9 cards in the first, 10 cards in each after.
+    chunks = [embeds[i:i + 10] for i in range(0, len(embeds), 10)]
+    payloads = [{"embeds": c, "allowed_mentions": {"parse": []}} for c in chunks]
+
+    ids = state.get("board_message_ids")
+    if ids is None and state.get("board_message_id"):
+        ids = [state.pop("board_message_id")]  # migrate from single-message board
+    ids = ids or []
+
+    if len(ids) == len(payloads):
+        ok = True
+        for msg_id, payload in zip(ids, payloads):
+            if not discord_edit(webhook, msg_id, payload):
+                ok = False  # someone deleted a board message
+                break
+            time.sleep(0.5)
+        if ok:
+            state["board_message_ids"] = ids
+            return
+
+    # Message count changed (or a message vanished): repost the whole board so it stays contiguous.
+    for msg_id in ids:
+        discord_delete(webhook, msg_id)
+        time.sleep(0.5)
+    new_ids = []
+    for payload in payloads:
+        new_ids.append(discord_send(webhook, {**payload, "username": "JB Hi-Fi Monitor"}))
+        time.sleep(0.5)
+    state["board_message_ids"] = new_ids
+    print(f"Posted board as {len(new_ids)} message(s) {new_ids} — pin the first one in Discord.")
 
 
 # --------------------------------------------------------------------------- state + diff

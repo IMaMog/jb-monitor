@@ -3,7 +3,7 @@
 Checks JB Hi-Fi every 15 minutes, one second past each quarter hour (hh:00:01, hh:15:01, hh:30:01, hh:45:01), using GitHub Actions, for Pokémon TCG products **sold by JB Hi-Fi itself** (marketplace sellers are excluded) and posts to Discord:
 
 - **Alerts**: a clean embed when a product is **newly listed** or comes **back in stock** (price, status, per-customer limit, release date for pre-orders, online/in-store, set, image).
-- **Live board**: one message listing everything currently available, grouped into Pre-orders / In stock / Limited stock. It's edited in place every run, so you pin it once and it stays current.
+- **Live board**: a card with an image for every product currently available, ordered Pre-orders → In stock → Limited stock and coloured by status. It's edited in place every run, so you pin it once and it stays current. Discord fits 9 cards (plus the header) in a message. If the count crosses 9, 19, and so on, the board is reposted as more or fewer messages, and you'd need to re-pin. A dedicated board channel avoids needing a pin at all.
 
 By default it tracks sealed card product only (boosters, blisters, display boxes, decks, collections). Set `INCLUDE_ACCESSORIES=true` to also track sleeves, binders, playmats and deck boxes.
 
