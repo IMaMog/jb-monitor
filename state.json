@@ -1,5 +1,7 @@
 {
-  "board_message_id": "1573475281321205925",
+  "board_message_ids": [
+    "1573475281321205925"
+  ],
   "products": {
     "815368": {
       "expansion": null,
