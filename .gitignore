@@ -3,4 +3,3 @@ __pycache__/
 .env
 state.local.json
 logs/
-state_target.local.json

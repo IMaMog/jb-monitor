@@ -1,22 +1,17 @@
-"""JB Hi-Fi / Target AU Pokemon TCG monitor.
+"""JB Hi-Fi Pokemon TCG monitor.
 
-JB Hi-Fi: polls JB's search API for Pokemon TCG products sold by JB Hi-Fi itself
-(no marketplace sellers).
-Target AU: reads the product list embedded in Target's Pokemon Cards category page.
-
-For either retailer it posts Discord alerts for new listings and restocks, and keeps
-a "currently available" board message up to date.
+Polls JB Hi-Fi's search API for Pokemon TCG products sold by JB Hi-Fi itself
+(no marketplace sellers), posts Discord alerts for new listings and restocks,
+and keeps a single "currently available" board message up to date.
 
 Standard library only, so it runs on a bare GitHub Actions runner.
 
 Usage:
-    python monitor.py                    # JB Hi-Fi normal run (used by the workflow)
-    python monitor.py --retailer target  # Target AU normal run
-    python monitor.py --dry-run          # fetch + diff, print payloads, send nothing, save nothing
-    python monitor.py --test-alert       # send one sample alert so you can see the format
+    python monitor.py               # normal run (used by the workflow)
+    python monitor.py --dry-run     # fetch + diff, print payloads, send nothing, save nothing
+    python monitor.py --test-alert  # send one sample alert so you can see the format
 
-Environment (for Target, a TARGET_-prefixed variable wins over the plain one,
-e.g. TARGET_DISCORD_WEBHOOK_URL, so both monitors can share one .env):
+Environment:
     DISCORD_WEBHOOK_URL        required  channel that receives alerts
     DISCORD_BOARD_WEBHOOK_URL  optional  channel for the live board (defaults to the alert webhook)
     DISCORD_PING               optional  mention added to alerts, e.g. <@123> or <@&456>
@@ -30,7 +25,6 @@ import csv
 import json
 import os
 import random
-import re
 import sys
 import time
 import urllib.error
@@ -72,7 +66,6 @@ STATUS_STYLE = {
     "preorder":    ("Pre-order",     0x8B5CF6, "🟣"),
     "in_stock":    ("In stock",      0x22C55E, "🟢"),
     "limited":     ("Limited stock", 0xF59E0B, "🟠"),
-    "coming_soon": ("Coming soon",   0x3B82F6, "🔵"),
     "unavailable": ("Sold out",      0x6B7280, "⚫"),
 }
 AVAILABLE = {"preorder", "in_stock", "limited"}
@@ -175,120 +168,6 @@ def normalise(hit: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- Target AU
-
-TARGET_CATEGORY_URL = "https://www.target.com.au/c/toys/trading-card-games/pokemon-cards/W1852642"
-TARGET_HEADERS = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "en-AU,en;q=0.9",
-    "user-agent": API_HEADERS["user-agent"],
-}
-TARGET_PAGE_SIZE = 48
-NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
-# The category also holds plush and sleeves. Cards = "Pokemon" + "TCG"/"Trading Card Game";
-# accessories are Pokemon items matching these words ("Sleeved Booster" is still a card product).
-TARGET_TCG_RE = re.compile(r"\b(tcg|trading card game)\b", re.I)
-TARGET_ACCESSORY_RE = re.compile(
-    r"\b(sleeves|deck protector|portfolio|binder|toploader|pages|playmat|deck box|album|"
-    r"storage|protector)\b", re.I)
-
-
-def http_text(url: str, headers: dict, retries: int = 3) -> str:
-    for attempt in range(1, retries + 1):
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            if (e.code == 429 or e.code >= 500) and attempt < retries:
-                time.sleep(float(e.headers.get("Retry-After") or 2 * attempt))
-                continue
-            raise RuntimeError(f"GET {url} failed: HTTP {e.code}") from None
-        except (urllib.error.URLError, TimeoutError):
-            if attempt == retries:
-                raise
-            time.sleep(2 * attempt)
-    raise RuntimeError("unreachable")
-
-
-def target_kind(title: str) -> str | None:
-    """'cards', 'accessory', or None for anything that isn't Pokemon TCG."""
-    if not re.search(r"pok[eé]mon", title, re.I):
-        return None
-    if TARGET_ACCESSORY_RE.search(title):
-        return "accessory"
-    if TARGET_TCG_RE.search(title):
-        return "cards"
-    return None  # plush, figures, etc.
-
-
-def fetch_target(include_accessories: bool) -> dict[str, dict]:
-    wanted = {"cards"} | ({"accessory"} if include_accessories else set())
-    products: dict[str, dict] = {}
-    for page in range(1, 11):  # page guard
-        url = TARGET_CATEGORY_URL + (f"?page={page}" if page > 1 else "")
-        m = NEXT_DATA_RE.search(http_text(url, TARGET_HEADERS))
-        if not m:
-            raise RuntimeError(f"Target page has no __NEXT_DATA__ (blocked or redesigned?): {url}")
-        plist = json.loads(m.group(1))["props"]["pageProps"]["metadata"]["productList"]
-        hits = plist.get("products") or []
-        for hit in hits:
-            if target_kind(hit.get("title", "")) in wanted:
-                p = normalise_target(hit)
-                products[p["sku"]] = p
-        if not hits or page * TARGET_PAGE_SIZE >= (plist.get("totalNumProducts") or 0):
-            break
-    return products
-
-
-def normalise_target(hit: dict) -> dict:
-    variations = hit.get("variations") or []
-    price = hit.get("price") or {}
-    if hit.get("displayOnly"):
-        status = "unavailable"
-    elif any(v.get("inStock") for v in variations):
-        status = "in_stock"
-    elif any(v.get("comingSoon") for v in variations):
-        status = "coming_soon"
-    else:
-        status = "unavailable"
-    image = next((v.get("imageUrl") for v in variations if v.get("imageUrl")), None) or hit.get("imageUrl") or ""
-    was = price.get("wasPrice") or 0
-    return {
-        "sku": str(hit["id"]),
-        "title": " ".join(hit.get("title", "").split()),
-        "url": hit.get("baseProductUrl") or "",
-        "image": image,
-        "price": float(price.get("offerPrice") or 0),
-        "was_price": float(was) if was else None,
-        "status": status,
-        "where": [],
-        "limit": None,
-        "release": None,
-        "expansion": None,
-        "group": None,
-    }
-
-
-RETAILERS = {
-    "jb": {
-        "name": "JB Hi-Fi",
-        "fetch": fetch_products,
-        "state": "state.json",
-        "board_url": "https://www.jbhifi.com.au/collections/pokemon-trading-cards",
-        "env_prefix": "",
-    },
-    "target": {
-        "name": "Target",
-        "fetch": fetch_target,
-        "state": "state_target.json",
-        "board_url": TARGET_CATEGORY_URL,
-        "env_prefix": "TARGET_",
-    },
-}
-SHOP = RETAILERS["jb"]  # set from --retailer in main()
-
-
 # --------------------------------------------------------------------------- formatting
 
 
@@ -300,7 +179,7 @@ def money(v: float | None) -> str:
 
 def short_title(title: str) -> str:
     for prefix in ("Pokemon TCG - ", "Pokémon TCG - ", "Pokemon TCG: ", "Pokémon TCG: ",
-                   "Pokemon Trading Card Game - ", "Pokemon Trading Card Game: ", "Pokemon TCG "):
+                   "Pokemon Trading Card Game - ", "Pokemon TCG "):
         if title.startswith(prefix):
             return title[len(prefix):]
     return title
@@ -327,7 +206,7 @@ def is_future(iso: str | None) -> bool:
 
 def alert_embed(p: dict, kind: str) -> dict:
     label, colour, emoji = STATUS_STYLE[p["status"]]
-    heading = {"new": "New listing", "restock": "Back in stock", "live": "Now available"}[kind]
+    heading = {"new": "New listing", "restock": "Back in stock"}[kind]
 
     price = money(p["price"])
     if p["was_price"]:
@@ -348,7 +227,7 @@ def alert_embed(p: dict, kind: str) -> dict:
         fields.append({"name": "Set", "value": p["expansion"], "inline": True})
 
     embed = {
-        "author": {"name": f"{SHOP['name']}  •  {heading}"},
+        "author": {"name": f"JB Hi-Fi  •  {heading}"},
         "title": p["title"][:256],
         "url": p["url"],
         "color": colour,
@@ -371,8 +250,8 @@ def board_embeds(products: dict[str, dict]) -> list[dict]:
     live = [p for p in products.values() if p["status"] in AVAILABLE]
 
     header = {
-        "title": f"{SHOP['name']} — Pokémon TCG available now",
-        "url": SHOP["board_url"],
+        "title": "JB Hi-Fi — Pokémon TCG available now",
+        "url": "https://www.jbhifi.com.au/collections/pokemon-trading-cards",
         "color": 0xFACC15,
         "description": (
             f"**{len(live)}** products live"
@@ -451,7 +330,7 @@ def send_alerts(webhook: str, ping: str, alerts: list[tuple[dict, str]]) -> None
     for i in range(0, len(alerts), 10):
         batch = alerts[i:i + 10]
         payload = {
-            "username": f"{SHOP['name']} Monitor",
+            "username": "JB Hi-Fi Monitor",
             "embeds": [alert_embed(p, kind) for p, kind in batch],
             "allowed_mentions": {"parse": ["users", "roles"]},
         }
@@ -496,7 +375,7 @@ def update_board(webhook: str, state: dict, products: dict[str, dict]) -> None:
         time.sleep(0.5)
     new_ids = []
     for payload in payloads:
-        new_ids.append(discord_send(webhook, {**payload, "username": f"{SHOP['name']} Monitor"}))
+        new_ids.append(discord_send(webhook, {**payload, "username": "JB Hi-Fi Monitor"}))
         time.sleep(0.5)
     state["board_message_ids"] = new_ids
     print(f"Posted board as {len(new_ids)} message(s) {new_ids} — pin the first one in Discord.")
@@ -523,7 +402,7 @@ def diff(prev: dict[str, dict], current: dict[str, dict]) -> list[tuple[dict, st
             if p["status"] in AVAILABLE:
                 alerts.append((p, "new"))
         elif p["status"] in AVAILABLE and old.get("status") not in AVAILABLE:
-            alerts.append((p, "live" if old.get("status") == "coming_soon" else "restock"))
+            alerts.append((p, "restock"))
     return alerts
 
 
@@ -650,7 +529,7 @@ def fetch_logged(cfg: dict) -> dict[str, dict]:
     t0 = time.time()
     started = datetime.now(timezone.utc)
     try:
-        current = SHOP["fetch"](cfg["include_acc"])
+        current = fetch_products(cfg["include_acc"])
     except Exception as e:
         if cfg.get("log_polls"):
             log_csv("polls.csv", POLL_HEADER,
@@ -730,31 +609,21 @@ def main() -> int:
                     help='cron expression that triggered the run (GitHub passes e.g. "53 * * * *")')
     ap.add_argument("--loop", type=float, metavar="SECONDS",
                     help="poll continuously every SECONDS (±20%%), logging to logs/")
-    ap.add_argument("--retailer", choices=sorted(RETAILERS), default="jb", help="which store to monitor")
-    ap.add_argument("--state", help="state file (default state.json for JB, state_target.json for Target; use a separate one for local trials)")
+    ap.add_argument("--state", default="state.json", help="state file (use a separate one for local trials)")
     ap.add_argument("--env-file", default=".env", help="local file with DISCORD_WEBHOOK_URL=... etc.")
     args = ap.parse_args()
 
-    global SHOP
-    SHOP = RETAILERS[args.retailer]
     here = Path(__file__).parent
     load_dotenv(here / args.env_file)
-
-    def env(name: str) -> str:
-        # Retailer-specific variable (e.g. TARGET_DISCORD_WEBHOOK_URL) wins over the shared one.
-        prefixed = os.environ.get(SHOP["env_prefix"] + name, "").strip() if SHOP["env_prefix"] else ""
-        return prefixed or os.environ.get(name, "").strip()
-
-    alert_hook = env("DISCORD_WEBHOOK_URL")
+    alert_hook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     cfg = {
         "alert_hook": alert_hook,
-        "board_hook": env("DISCORD_BOARD_WEBHOOK_URL") or alert_hook,
-        "ping": env("DISCORD_PING"),
-        "include_acc": env("INCLUDE_ACCESSORIES").lower() in ("1", "true", "yes"),
+        "board_hook": os.environ.get("DISCORD_BOARD_WEBHOOK_URL", "").strip() or alert_hook,
+        "ping": os.environ.get("DISCORD_PING", "").strip(),
+        "include_acc": os.environ.get("INCLUDE_ACCESSORIES", "").lower() in ("1", "true", "yes"),
         "log_polls": bool(args.loop),
     }
-    state_file = args.state or SHOP["state"]
-    state_path = Path(state_file) if Path(state_file).is_absolute() else here / state_file
+    state_path = Path(args.state) if Path(args.state).is_absolute() else here / args.state
 
     if not alert_hook and not args.dry_run:
         print("DISCORD_WEBHOOK_URL is not set (env var or .env file)", file=sys.stderr)

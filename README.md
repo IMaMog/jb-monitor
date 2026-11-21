@@ -72,33 +72,7 @@ python monitor.py --loop 15 --state state.local.json
 
 If the trial looks good, run it permanently on an always-on machine and turn off the GitHub schedule, so alerts don't arrive twice.
 
-## Target AU monitor
-
-The same script also watches Target's [Pokémon Cards category](https://www.target.com.au/c/toys/trading-card-games/pokemon-cards/W1852642) with `--retailer target`. It sends the same alerts and runs its own board, and keeps its state in `state_target.json`. The workflow is `.github/workflows/target-monitor.yml`, which runs on the same quarter-hour slots.
-
-- **Source:** the category page is a Next.js page with the full product list embedded as JSON (`__NEXT_DATA__`). There's no API key and no login, just one normal page request per check (more only if the category grows past 48 products).
-- **Cards only:** the category also contains plush, sleeves and portfolios. A product counts as a card product if its title says Pokémon plus "TCG" or "Trading Card Game", and doesn't contain an accessory word (sleeves, deck protector, portfolio, binder, toploader…). "Sleeved Booster" still counts as cards. Set `TARGET_INCLUDE_ACCESSORIES=true` to also track the Pokémon accessories.
-- **Status:** a product is *In stock* if any variation is in stock, and *Coming soon* if Target marks it that way (no alert yet). When a Coming soon product goes live you get a **Now available** alert. Target removes sold-out items from the category, so a product that disappears is marked sold out and alerts again when it comes back.
-- Target doesn't publish per-customer limits, release dates or set names in the listing, so those fields are left off its alerts.
-
-**Setup:** add these in the same Actions settings, then run *Target Pokemon monitor* once from the Actions tab to seed it and post the board.
-
-| Kind | Name | Value |
-|---|---|---|
-| Secret | `TARGET_DISCORD_WEBHOOK_URL` | Target alerts webhook (optional; falls back to `DISCORD_WEBHOOK_URL`) |
-| Secret | `TARGET_DISCORD_BOARD_WEBHOOK_URL` | Target board webhook (optional; falls back to the Target alerts webhook) |
-| Variable | `TARGET_INCLUDE_ACCESSORIES` | `true` to include Pokémon accessories (optional) |
-
-`DISCORD_PING` is shared. Locally:
-
-```bash
-python monitor.py --retailer target --dry-run
-python monitor.py --retailer target --loop 30 --state state_target.local.json
-```
-
 ## Caveats
-
-- Target sits behind Akamai. A normal request gets through today, but if Akamai starts blocking GitHub's runner IPs, the run fails with "no `__NEXT_DATA__`" or an HTTP 403/429. If that happens, run it from a home machine instead.
 
 - GitHub's scheduled runs are best-effort. The 7-minute head start covers normal delays, but if GitHub is more than 7 minutes behind, that check happens late, and occasionally GitHub drops a scheduled run entirely. For guaranteed timing, run `monitor.py --at-quarter` from cron on a VPS or Raspberry Pi.
 - GitHub disables scheduled workflows in public repos after 60 days with no repository activity. If alerts stop, check the Actions tab and re-enable the workflow.
