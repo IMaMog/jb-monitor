@@ -1,8 +1,24 @@
 {
   "board_message_ids": [
-    "1573475281321205925"
+    "1573983129444556982",
+    "1573983133609627831"
   ],
   "products": {
+    "814533": {
+      "expansion": "Black Bolt & White Flare",
+      "first_seen": "2026-11-22T08:46:59+00:00",
+      "group": 1186,
+      "image": "https://cdn.shopify.com/s/files/1/0024/9803/5810/files/814533-Product-0-I-638839086602975129.jpg?v=1748311927",
+      "limit": 1,
+      "price": 38.0,
+      "release": "2026-12-03T13:00:00+00:00",
+      "sku": "814533",
+      "status": "preorder",
+      "title": "Pokemon TCG - Scarlet & Violet - Unova Poster Collection",
+      "url": "https://www.jbhifi.com.au/products/pokemon-tcg-scarlet-violet-unova-poster-collection-card-game",
+      "was_price": null,
+      "where": []
+    },
     "815368": {
       "expansion": null,
       "first_seen": "2026-11-20T23:09:00+00:00",
