@@ -1,7 +1,6 @@
 {
   "board_message_ids": [
-    "1574189058857504921",
-    "1574189063584616491"
+    "1574268530973478912"
   ],
   "products": {
     "814533": {
@@ -99,7 +98,7 @@
       "price": 8.5,
       "release": "2026-07-16T14:00:00+00:00",
       "sku": "896926",
-      "status": "limited",
+      "status": "unavailable",
       "title": "Pokemon TCG: Mega Evolution - Pitch Black Booster",
       "url": "https://www.jbhifi.com.au/products/pokemon-tcg-mega-evolution-pitch-black-booster-card-game",
       "was_price": null,
