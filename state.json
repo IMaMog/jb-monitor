@@ -10,13 +10,15 @@
       "image": "https://cdn.shopify.com/s/files/1/0024/9803/5810/files/814533-Product-0-I-638839086602975129.jpg?v=1748311927",
       "limit": 1,
       "price": 38.0,
-      "release": "2026-12-03T13:00:00+00:00",
+      "release": "2027-01-30T13:00:00+00:00",
       "sku": "814533",
-      "status": "unavailable",
+      "status": "preorder",
       "title": "Pokemon TCG - Scarlet & Violet - Unova Poster Collection",
       "url": "https://www.jbhifi.com.au/products/pokemon-tcg-scarlet-violet-unova-poster-collection-card-game",
       "was_price": null,
-      "where": []
+      "where": [
+        "Online"
+      ]
     },
     "815368": {
       "expansion": null,
